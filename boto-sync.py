@@ -8,17 +8,17 @@ from boto3.s3.transfer import TransferConfig
 MB = 1024 ** 2
 GB = 1024 ** 3
 s3_transfer_config = TransferConfig(
-        multipart_threshold = 1*MB,
-        multipart_chunksize = 1*MB,
-        use_threads = False,
-        max_concurrency = 1
-    )
+    multipart_threshold = 1*MB,
+    multipart_chunksize = 1*MB,
+    use_threads = False,
+    max_concurrency = 1
+)
 
-src_bucket = 'ray-boto-source'
-dst_bucket = 'ray-boto-dest'
+src_bucket = 'SOURCE-BUCKET'
+dst_bucket = 'DEST-BUCKET'
 
-s3_src = boto3.Session(profile_name='boto-source').client('s3')
-s3_dst = boto3.Session(profile_name='boto-dest').client('s3')
+s3_src = boto3.Session(profile_name='SOURCE-PROFILE').client('s3')
+s3_dst = boto3.Session(profile_name='DEST-PROFILE').client('s3')
 
 dst_keys = []
 dst = s3_dst.list_objects(Bucket=dst_bucket)
