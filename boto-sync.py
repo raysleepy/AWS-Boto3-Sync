@@ -25,17 +25,19 @@ dst = s3_dst.list_objects(Bucket=dst_bucket)
 if any('Contents' in x for x in dst):
     dst_keys = [x['Key'] for x in dst['Contents']]
 
-for item in s3_src.list_objects(Bucket=src_bucket)['Contents']:
-    key: str = item['Key']
-    filename = key.split('/')[-1]
-    local_path = os.path.join('data', 'tmp', filename)
-    if key in dst_keys:
-        print(f"Skipping {filename}")
-    else:
-        try:
-            s3_src.download_file(src_bucket, key, local_path)
-            print(f"Uploading {filename} to s3://{dst_bucket}/{key}")
-            s3_dst.upload_file(local_path, dst_bucket, key, Config=s3_transfer_config)
-            os.remove(local_path)
-        except Exception as e:
-            print(f"Error: {e}")
+src = s3_src.list_objects(Bucket=src_bucket)
+if any('Contents' in x for x in src):
+    for item in src['Contents']:
+        key: str = item['Key']
+        filename = key.split('/')[-1]
+        local_path = os.path.join('data', 'tmp', filename)
+        if key in dst_keys:
+            print(f"Skipping {filename}")
+        else:
+            try:
+                s3_src.download_file(src_bucket, key, local_path)
+                print(f"Uploading {filename} to s3://{dst_bucket}/{key}")
+                s3_dst.upload_file(local_path, dst_bucket, key, Config=s3_transfer_config)
+                os.remove(local_path)
+            except Exception as e:
+                print(f"Error: {e}")
