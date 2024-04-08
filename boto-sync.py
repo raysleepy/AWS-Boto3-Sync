@@ -4,8 +4,13 @@ from enum import Enum, IntEnum, auto
 import hashlib
 import json
 import logging
+import sqlite3
 import boto3
 from boto3.s3.transfer import TransferConfig
+
+import ssl
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 class Sizes(IntEnum):
     KB = 1024 ** 1
@@ -30,20 +35,21 @@ class Configs(Enum):
         max_concurrency = 1,
     )
     HASH_CHUNK_SIZE = 100 * Sizes.MB
-    CHECK_MODE = Checks.FILE_TIMESTAMP_DIFFERS
+    CHECK_MODE = Checks.FILE_HASH
     LOG_LEVEL = logging.INFO
     DATA_DIR = 'data'
     TMP_DIR = 'tmp'
+    DB = 'hash.db'
     TEST_MODE = False
     MAX_FILE_COUNT = 9999
     MAX_TIMESTAMP_DELTA_IN_SECONDS = 10
 
-logging.basicConfig(encoding='utf-8', format='%(asctime)s %(levelname)s:%(message)s', datefmt='%Y/%m/%d %H::%M:%S', level=Configs.LOG_LEVEL.value)
+logging.basicConfig(encoding='utf-8', format='%(asctime)s %(levelname)s:%(message)s', datefmt='%Y/%m/%d %H:%M:%S', level=Configs.LOG_LEVEL.value)
 logger = logging.getLogger(__name__)
 
 ts_file_path = os.path.join(Configs.DATA_DIR.value, 'last_run')
 
-lastrun_ts = datetime(1971, 1, 1, 0, 0, 0)
+lastrun_ts = datetime(1970, 1, 1, 0, 0, 0)
 if os.path.exists(ts_file_path):
     try:
         with open(ts_file_path, 'r+') as f:
@@ -66,11 +72,17 @@ def get_file_hash(file_path: str):
     logger.info(f"File hash for {file_path} is {digest}")
     return digest
 
-def update_file_hash(file_path: str, dst_bucket: str, dst_key: str):
-    get_file_hash(file_path)
-    logger.info(f"Updating file hash for s3://{dst_bucket}/{dst_key}")
-    # TODO
-    pass
+def update_hash(file_path: str, src_bucket: str, src_key: str, dst_bucket: str, dst_key: str):
+    logger.debug(f"Checking file hash for s3://{dst_bucket}/{dst_key}")
+    new_hash = get_file_hash(file_path)
+    old_hash = get_hash_from_db(dst_key)
+    if old_hash is None:
+        logger.info(f"File hash not found for s3://{dst_bucket}/{dst_key}")
+        insert_hash(src_bucket, src_key, new_hash, dst_key)
+    else:
+        if new_hash == old_hash:
+            logger.info("Hash is the same")
+    return False
 
 def update_timestamp():
     now = datetime.now(tz=timezone.utc).replace(microsecond=0)
@@ -80,6 +92,61 @@ def update_timestamp():
         logger.info(f"Updated last run timestamp to {now}")
     except Exception as e:
         logger.error(f"Error: {e}")
+
+def hash_table_exists() -> bool:
+    db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    sql = f"select 1 from sqlite_schema where type='table' and name='hash'"
+    cur.execute(sql)
+    rowcount = len(cur.fetchall())
+    conn.commit()
+    conn.close()
+    if rowcount > 0:
+        logger.debug("Hash table exists")
+        return True
+    else:
+        logger.info("Hash table does not exist")
+        return False
+
+def create_hash_table():
+    if not hash_table_exists():
+        logger.info("Creating hash table")
+        db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
+        conn = sqlite3.connect(db)
+        cur = conn.cursor()
+        sql = f"create table if not exists hash(src_bucket text, src_key text, src_hash text, dst_key text, dst_hash text);"
+        cur.execute(sql)
+        conn.commit()
+        conn.close()
+
+def get_hash_from_db(dst_key: str) -> str:
+    create_hash_table()
+    db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    sql = f"select dst_hash from hash where dst_key='{dst_key}'"
+    cur.execute(sql)
+    result = cur.fetchone()
+    conn.commit()
+    conn.close()
+    if result is None:
+        logger.info("Hash not found in DB")
+        return None
+    else:
+        logger.info(f"Hash found in DB. It's {result[0]}")
+        return result[0]
+    
+def insert_hash(src_bucket: str, src_key: str, src_hash: str, dst_key: str):
+    create_hash_table()
+    db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    sql = f"insert into hash values ('{src_bucket}', '{src_key}', '{src_hash}', '{dst_key}', '{src_hash}')"
+    logger.info(sql)
+    cur.execute(sql)
+    conn.commit()
+    conn.close()
 
 def need_to_sync(item: object, dst_prefix: str, dst_keys: list[str], dst: list[object]) -> bool:
     src_key = item['Key']
@@ -127,8 +194,7 @@ def need_to_sync(item: object, dst_prefix: str, dst_keys: list[str], dst: list[o
                 return True
 
         case Checks.FILE_HASH:
-            # TODO
-            return False
+            return True
 
         case _:
             return False
@@ -162,19 +228,24 @@ def sync_one_bucket(src_profile: str, src_bucket: str, dst_profile: str, dst_buc
 
             logger.info(f"Evaluating s3://{src_bucket}/{src_key}")
             logger.debug(json.dumps(item, default=serialize_datetime, indent=4))
+
             if need_to_sync(item, dst_prefix, dst_keys, dst):
                 try:
                     logger.info(f"Downloading s3://{src_bucket}/{src_key} to {file_path}")
                     s3_src.download_file(src_bucket, src_key, file_path)
-                    
+
                     if Configs.TEST_MODE.value:
                         logger.info("Test mode => skipping")
                     else:
-                        logger.info(f"Uploading {filename} to s3://{dst_bucket}/{dst_key}")
-                        s3_dst.upload_file(file_path, dst_bucket, dst_key, Config=Configs.S3_TX_CONFIGS.value)
-                    
-                    if Configs.CHECK_MODE.value is Checks.FILE_HASH:
-                        update_file_hash(file_path, dst_bucket, dst_key)
+                        if Configs.CHECK_MODE.value is not Checks.FILE_HASH:
+                            logger.info(f"Uploading {filename} to s3://{dst_bucket}/{dst_key}")
+                            s3_dst.upload_file(file_path, dst_bucket, dst_key, Config=Configs.S3_TX_CONFIGS.value)
+                        else:
+                            if update_hash(file_path, src_bucket, src_key, dst_bucket, dst_key):
+                                logger.info(f"Uploading {filename} to s3://{dst_bucket}/{dst_key}")
+                                s3_dst.upload_file(file_path, dst_bucket, dst_key, Config=Configs.S3_TX_CONFIGS.value)
+                            else:
+                                logger.info("No need to upload")
 
                     if not Configs.TEST_MODE.value:
                         logger.info(f"Deleting {file_path}")
