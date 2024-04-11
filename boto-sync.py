@@ -58,33 +58,7 @@ if os.path.exists(ts_file_path):
         logger.error(f"Error: {e}")
 logger.info(f"Last run timestamp: {lastrun_ts}")
 
-def serialize_datetime(obj: object): 
-    if isinstance(obj, datetime): 
-        return obj.isoformat() 
-    raise TypeError("Type not serializable")
-
-def get_file_hash(file_path: str):
-    with open(file_path, 'rb') as f:
-        hash = hashlib.md5()
-        while chunk := f.read(Configs.HASH_CHUNK_SIZE.value):
-            hash.update(chunk)
-    digest = hash.hexdigest()
-    logger.info(f"File hash for {file_path} is {digest}")
-    return digest
-
-def update_hash(file_path: str, src_bucket: str, src_key: str, dst_bucket: str, dst_key: str):
-    logger.debug(f"Checking file hash for s3://{dst_bucket}/{dst_key}")
-    new_hash = get_file_hash(file_path)
-    old_hash = get_hash_from_db(dst_key)
-    if old_hash is None:
-        logger.info(f"File hash not found for s3://{dst_bucket}/{dst_key}")
-        insert_hash(src_bucket, src_key, new_hash, dst_key)
-    else:
-        if new_hash == old_hash:
-            logger.info("Hash is the same")
-    return False
-
-def update_timestamp():
+def update_timestamp() -> None:
     now = datetime.now(tz=timezone.utc).replace(microsecond=0)
     try:
         with open(ts_file_path, 'w+') as f:
@@ -93,7 +67,38 @@ def update_timestamp():
     except Exception as e:
         logger.error(f"Error: {e}")
 
-def hash_table_exists() -> bool:
+def serialize_datetime(obj: object) -> None:
+    if isinstance(obj, datetime): 
+        return obj.isoformat() 
+    raise TypeError("Type not serializable")
+
+def get_file_hash(file_path: str) -> str:
+    with open(file_path, 'rb') as f:
+        hash = hashlib.md5()
+        while chunk := f.read(Configs.HASH_CHUNK_SIZE.value):
+            hash.update(chunk)
+    digest = hash.hexdigest()
+    logger.info(f"File hash for {file_path} is {digest}")
+    return digest
+
+def update_hash(file_path: str, src_bucket: str, src_key: str, dst_bucket: str, dst_key: str) -> bool:
+    logger.debug(f"Checking file hash for s3://{dst_bucket}/{dst_key}")
+    hash_from_file = get_file_hash(file_path)
+    hash_from_db = db_get_hash(dst_key)
+    if hash_from_db is None:
+        logger.info(f"File hash not found for s3://{dst_bucket}/{dst_key}")
+        db_insert_hash(src_bucket, src_key, hash_from_file, dst_key)
+        return True
+    else:
+        if hash_from_file == hash_from_db:
+            logger.info("Hash is the same")
+            return False
+        else:
+            logger.info("Hash is not the same")
+            db_update_hash(hash_from_file, dst_key)
+            return True
+
+def db_hash_table_exists() -> bool:
     db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
     conn = sqlite3.connect(db)
     cur = conn.cursor()
@@ -109,8 +114,8 @@ def hash_table_exists() -> bool:
         logger.info("Hash table does not exist")
         return False
 
-def create_hash_table():
-    if not hash_table_exists():
+def db_create_hash_table() -> None:
+    if not db_hash_table_exists():
         logger.info("Creating hash table")
         db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
         conn = sqlite3.connect(db)
@@ -120,8 +125,8 @@ def create_hash_table():
         conn.commit()
         conn.close()
 
-def get_hash_from_db(dst_key: str) -> str:
-    create_hash_table()
+def db_get_hash(dst_key: str) -> str:
+    db_create_hash_table()
     db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
     conn = sqlite3.connect(db)
     cur = conn.cursor()
@@ -137,12 +142,23 @@ def get_hash_from_db(dst_key: str) -> str:
         logger.info(f"Hash found in DB. It's {result[0]}")
         return result[0]
     
-def insert_hash(src_bucket: str, src_key: str, src_hash: str, dst_key: str):
-    create_hash_table()
+def db_insert_hash(src_bucket: str, src_key: str, src_hash: str, dst_key: str) -> None:
+    db_create_hash_table()
     db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
     conn = sqlite3.connect(db)
     cur = conn.cursor()
     sql = f"insert into hash values ('{src_bucket}', '{src_key}', '{src_hash}', '{dst_key}', '{src_hash}')"
+    logger.info(sql)
+    cur.execute(sql)
+    conn.commit()
+    conn.close()
+
+def db_update_hash(src_hash: str, dst_key: str) -> None:
+    db_create_hash_table()
+    db = os.path.join(Configs.DATA_DIR.value, Configs.DB.value)
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    sql = f"update hash set src_hash = '{src_hash}', dst_hash = '{src_hash}' where dst_key = '{dst_key}'"
     logger.info(sql)
     cur.execute(sql)
     conn.commit()
@@ -199,7 +215,7 @@ def need_to_sync(item: object, dst_prefix: str, dst_keys: list[str], dst: list[o
         case _:
             return False
 
-def sync_one_bucket(src_profile: str, src_bucket: str, dst_profile: str, dst_bucket: str, dst_prefix: str):
+def sync_one_bucket(src_profile: str, src_bucket: str, dst_profile: str, dst_bucket: str, dst_prefix: str) -> None:
     s3_src = boto3.Session(profile_name=src_profile).client('s3', verify=Configs.SSL_CERT_VERIFICATION.value)
     s3_dst = boto3.Session(profile_name=dst_profile).client('s3', verify=Configs.SSL_CERT_VERIFICATION.value)
 
@@ -250,6 +266,7 @@ def sync_one_bucket(src_profile: str, src_bucket: str, dst_profile: str, dst_buc
                     if not Configs.TEST_MODE.value:
                         logger.info(f"Deleting {file_path}")
                         os.remove(file_path)
+
                 except Exception as e:
                     logger.error(f"Error: {e}")
 
